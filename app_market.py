@@ -425,5 +425,5 @@ with col_right:
         all_tranches.sort(key=lambda x: x["Bid Price"])
         df_stack = pd.DataFrame(all_tranches)
         df_stack["Bid Price"] = df_stack["Bid Price"].apply(lambda p: f"${p:.2f}")
-        df_stack["Cleared"] = df_stack["Cleared"].apply(m: f"{lambda m:.0f} MW")
+        df_stack["Cleared"] = df_stack["Cleared"].apply(lambda m: f"{m:.0f} MW")
         st.dataframe(df_stack, use_container_width=True, hide_index=True)
