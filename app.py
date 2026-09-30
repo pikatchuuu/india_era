@@ -142,7 +142,7 @@ def finalize_settlement(state):
         remaining_cap -= awarded
         team["awarded_mw"] = awarded
         
-        bonus_land = int(np.random.randint(10, 101))
+        bonus_land = int(np.random.randint(50, 150))
         team["bonus_land"] = bonus_land
         total_land = 100.0 + bonus_land
         team["total_land"] = total_land
