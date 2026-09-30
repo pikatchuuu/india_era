@@ -8,7 +8,7 @@ import os
 
 st.set_page_config(page_title="India RE Reverse Auction", layout="wide")
 
-# Poll every 2 seconds to synchronize with the server file
+# Poll every 2 seconds to synchronize across all browser tabs
 st_autorefresh(interval=2000, key="global_sync")
 
 STATE_FILE = "game_state.json"
@@ -22,6 +22,7 @@ def init_default_state():
         "game_id": 1,
         "phase": "LOBBY",  # LOBBY, PHASE_1, PHASE_2, LIVE_RA, SETTLEMENT
         "tender_capacity": 0.0,
+        "ra_start_timestamp": 0.0,
         "last_bid_timestamp": 0.0,
         "teams": {}
     }
@@ -48,7 +49,7 @@ def save_game(state):
 game = load_game()
 
 # ==========================================
-# 2. PERSISTENT LOGIN RECOVERY
+# 2. PERSISTENT LOGIN RECOVERY (URL-BACKED)
 # ==========================================
 url_team = st.query_params.get("team")
 if url_team:
@@ -66,7 +67,7 @@ if st.query_params.get("role") == "admin":
     st.session_state["is_admin"] = True
 
 # ==========================================
-# 4. IRR MATRIX ENGINE
+# 4. IRR MATRIX ENGINE & STRICT BOUNDS
 # ==========================================
 @st.cache_data
 def load_irr_engine():
@@ -76,9 +77,21 @@ def load_irr_engine():
 
 irr_data = load_irr_engine()
 
+MIN_TARIFF = float(min(irr_data['tariffs']))
+MAX_TARIFF = float(max(irr_data['tariffs']))
+MIN_CAP = float(min(irr_data['capacities']))
+MAX_CAP = float(max(irr_data['capacities']))
+
 def lookup_base_irr(tariff: float, capacity: float) -> float:
     if capacity <= 0:
         return 0.0
+    
+    # Strict boundary guard: return 0.0 if inputs fall outside matrix limits
+    if capacity < MIN_CAP or capacity > MAX_CAP:
+        return 0.0
+    if tariff < MIN_TARIFF or tariff > MAX_TARIFF:
+        return 0.0
+
     caps = irr_data['capacities']
     tariffs = irr_data['tariffs']
     
@@ -100,6 +113,7 @@ def advance_game_phase():
         state["tender_capacity"] = min(1500.0, 0.80 * total_mw)
         state["phase"] = "PHASE_2"
     elif phase == "PHASE_2":
+        # H1 Elimination: highest ceiling tariff eliminated; ties to later timestamp
         sorted_teams = sorted(
             state["teams"].values(),
             key=lambda t: (-t["ceiling_tariff"], t["timestamp"])
@@ -108,7 +122,9 @@ def advance_game_phase():
             eliminated = sorted_teams[0]["name"]
             state["teams"][eliminated]["qualified"] = False
         state["phase"] = "LIVE_RA"
-        state["last_bid_timestamp"] = time.time()
+        now = time.time()
+        state["ra_start_timestamp"] = now  # 10-minute hard cap anchor
+        state["last_bid_timestamp"] = now  # 60-second inactivity anchor
     elif phase == "LIVE_RA":
         finalize_settlement(state)
         
@@ -152,9 +168,13 @@ def finalize_settlement(state):
             team["final_irr"] = 0.0
             team["meets_hurdle"] = False
 
-if game["phase"] == "LIVE_RA" and game["last_bid_timestamp"] > 0:
-    elapsed = time.time() - game["last_bid_timestamp"]
-    if elapsed >= 60.0:
+# DUAL TIMERS CHECK (Inactivity: 60s OR Absolute Hard Cap: 600s)
+if game["phase"] == "LIVE_RA" and game.get("ra_start_timestamp", 0) > 0:
+    now = time.time()
+    total_elapsed = now - game["ra_start_timestamp"]
+    inactive_elapsed = now - game["last_bid_timestamp"]
+    
+    if inactive_elapsed >= 60.0 or total_elapsed >= 600.0:
         state = load_game()
         if state["phase"] == "LIVE_RA":
             finalize_settlement(state)
@@ -187,8 +207,8 @@ else:
     st.sidebar.write(f"**Current Phase:** `{game['phase']}` (Game #{game['game_id']})")
     
     total_registered = len(game["teams"])
-    p1_submitted = sum(1 for t in game["teams"].values() if t["bid_mw"] >= 50)
-    p2_submitted = sum(1 for t in game["teams"].values() if t["ceiling_tariff"] > 0)
+    p1_submitted = sum(1 for t in game["teams"].values() if t["bid_mw"] >= MIN_CAP)
+    p2_submitted = sum(1 for t in game["teams"].values() if t["ceiling_tariff"] >= MIN_TARIFF)
     
     if game["phase"] == "PHASE_1":
         st.sidebar.info(f"Phase 1 Submissions: {p1_submitted}/{total_registered}")
@@ -215,18 +235,17 @@ tab_game, tab_matrix = st.tabs(["🎮 Auction Arena", "📈 Financial Model & IR
 
 with tab_matrix:
     st.subheader("Base IRR Reference Matrix & Calculator")
-    st.markdown("Use this calculator to evaluate how different combinations of **Capacity (MW)** and **Tariff (INR/kWh)** impact your project returns before bidding.")
+    st.info(f"Allowed Tariff Range: **{MIN_TARIFF:.2f}** to **{MAX_TARIFF:.2f} INR/kWh** | Capacity Range: **{int(MIN_CAP)}** to **{int(MAX_CAP)} MW**")
     
     c_m1, c_m2, c_m3 = st.columns(3)
-    calc_mw = c_m1.number_input("Test Capacity (MW)", min_value=50, max_value=750, step=10, value=250)
-    calc_tariff = c_m2.number_input("Test Tariff (INR/kWh)", min_value=1.00, max_value=5.00, step=0.01, value=2.70, format="%.2f")
+    calc_mw = c_m1.number_input("Test Capacity (MW)", min_value=int(MIN_CAP), max_value=int(MAX_CAP), step=10, value=int(MIN_CAP))
+    calc_tariff = c_m2.number_input("Test Tariff (INR/kWh)", min_value=MIN_TARIFF, max_value=MAX_TARIFF, step=0.01, value=MIN_TARIFF, format="%.2f")
     calc_res = lookup_base_irr(calc_tariff, calc_mw)
     c_m3.metric("Corresponding Base IRR", f"{calc_res * 100:.2f}%")
     
     st.markdown("---")
     st.write("**Full Reference Grid (Tariffs vs MW Capacities):**")
     
-    # Format grid into a pandas dataframe with percentage display
     matrix_df = pd.DataFrame(
         [[f"{val * 100:.2f}%" for val in row] for row in irr_data['grid']],
         index=[f"{t:.2f}" for t in irr_data['tariffs']],
@@ -303,52 +322,78 @@ with tab_game:
                 if not my_data.get("qualified", True):
                     st.error("Your company was eliminated under the H1 Ceiling Rule.")
                 else:
+                    # Envelope I Submission (Capacity Limited)
                     if game["phase"] == "PHASE_1":
                         with st.form("env1_form"):
                             st.write("**Envelope I: Technical Bid (Confidential)**")
-                            default_mw = my_data.get("bid_mw") if my_data.get("bid_mw", 0) >= 50 else 100
-                            mw = st.number_input("Bidding Capacity (MW) [50-750 MW in increments of 10]", min_value=50, max_value=750, step=10, value=default_mw)
+                            default_mw = my_data.get("bid_mw") if my_data.get("bid_mw", 0) >= MIN_CAP else MIN_CAP
+                            mw = st.number_input(f"Bidding Capacity (MW) [{int(MIN_CAP)}-{int(MAX_CAP)} MW in increments of 10]", min_value=int(MIN_CAP), max_value=int(MAX_CAP), step=10, value=int(default_mw))
                             if st.form_submit_button("Submit Capacity"):
-                                s = load_game()
-                                s["teams"][current_team_name]["bid_mw"] = int(mw)
-                                save_game(s)
-                                st.success(f"Submitted: {mw} MW")
-                                st.rerun()
+                                mw_val = int(mw)
+                                if not (MIN_CAP <= mw_val <= MAX_CAP):
+                                    st.error(f"Capacity must be between {int(MIN_CAP)} MW and {int(MAX_CAP)} MW.")
+                                elif mw_val % 10 != 0:
+                                    st.error("Capacity must be submitted in increments of 10 MW.")
+                                else:
+                                    s = load_game()
+                                    s["teams"][current_team_name]["bid_mw"] = mw_val
+                                    save_game(s)
+                                    st.success(f"Submitted: {mw_val} MW")
+                                    st.rerun()
 
+                    # Envelope II Submission (Tariff Limited)
                     elif game["phase"] == "PHASE_2":
                         with st.form("env2_form"):
                             st.write("**Envelope II: Financial Bid (Confidential)**")
-                            default_t = my_data.get("ceiling_tariff") if my_data.get("ceiling_tariff", 0.0) > 0 else 2.70
-                            t_val = st.number_input("Ceiling Tariff (INR/kWh)", min_value=1.00, max_value=5.00, step=0.01, value=default_t, format="%.2f")
+                            st.caption(f"Allowed Ceiling Tariff Range: **{MIN_TARIFF:.2f}** to **{MAX_TARIFF:.2f} INR/kWh**")
+                            default_t = my_data.get("ceiling_tariff") if my_data.get("ceiling_tariff", 0.0) >= MIN_TARIFF else MAX_TARIFF
+                            t_val = st.number_input("Ceiling Tariff (INR/kWh)", min_value=MIN_TARIFF, max_value=MAX_TARIFF, step=0.01, value=float(default_t), format="%.2f")
                             if st.form_submit_button("Submit Ceiling Tariff"):
-                                s = load_game()
-                                s["teams"][current_team_name]["ceiling_tariff"] = float(t_val)
-                                s["teams"][current_team_name]["current_tariff"] = float(t_val)
-                                s["teams"][current_team_name]["timestamp"] = time.time()
-                                save_game(s)
-                                st.success(f"Submitted Ceiling Tariff: {t_val:.2f}")
-                                st.rerun()
+                                if MIN_TARIFF <= t_val <= MAX_TARIFF:
+                                    s = load_game()
+                                    s["teams"][current_team_name]["ceiling_tariff"] = float(t_val)
+                                    s["teams"][current_team_name]["current_tariff"] = float(t_val)
+                                    s["teams"][current_team_name]["timestamp"] = time.time()
+                                    save_game(s)
+                                    st.success(f"Submitted Ceiling Tariff: {t_val:.2f}")
+                                    st.rerun()
+                                else:
+                                    st.error(f"Tariff must be between {MIN_TARIFF:.2f} and {MAX_TARIFF:.2f} INR/kWh.")
 
+                    # Phase 3: Live Reverse Auction (Tariff Limited + Undercut Validation)
                     elif game["phase"] == "LIVE_RA":
-                        st.write(f"Your Active Tariff: **{my_data.get('current_tariff', 0.0):.2f} INR/kWh**")
+                        current_t = my_data.get('current_tariff', MAX_TARIFF)
+                        st.write(f"Your Active Tariff: **{current_t:.2f} INR/kWh**")
+                        st.caption(f"Auction Tariff Floor (Lower Limit): **{MIN_TARIFF:.2f} INR/kWh**")
+                        
                         with st.form("bid_form"):
-                            default_undercut = max(1.00, my_data.get('current_tariff', 2.70) - 0.01)
-                            new_bid = st.number_input("Submit Undercut Tariff (INR/kWh)", min_value=1.00, max_value=5.00, step=0.01, value=default_undercut, format="%.2f")
+                            suggested_bid = max(MIN_TARIFF, round(current_t - 0.01, 2))
+                            new_bid = st.number_input(
+                                "Submit Undercut Tariff (INR/kWh)",
+                                min_value=MIN_TARIFF,
+                                max_value=float(current_t),
+                                step=0.01,
+                                value=float(suggested_bid),
+                                format="%.2f"
+                            )
                             if st.form_submit_button("Submit Bid"):
-                                if new_bid < my_data["current_tariff"]:
+                                if new_bid < MIN_TARIFF:
+                                    st.error(f"Bid rejected: Tariff cannot go below the minimum limit of {MIN_TARIFF:.2f} INR/kWh.")
+                                elif new_bid >= current_t:
+                                    st.error("Bid must be strictly lower than your current active tariff.")
+                                else:
                                     s = load_game()
                                     s["teams"][current_team_name]["current_tariff"] = float(new_bid)
                                     s["teams"][current_team_name]["timestamp"] = time.time()
-                                    s["last_bid_timestamp"] = time.time()
+                                    s["last_bid_timestamp"] = time.time()  # Reset 60s ticker
                                     save_game(s)
                                     st.success(f"Undercut bid of {new_bid:.2f} accepted.")
                                     st.rerun()
-                                else:
-                                    st.error("Bid must be strictly lower than your active tariff.")
 
                     elif game["phase"] == "LOBBY":
                         st.info("Waiting for the Facilitator to start Envelope I...")
 
+                    # Phase 4: Final Settlement Breakdown Card
                     elif game["phase"] == "SETTLEMENT":
                         st.markdown("### 📊 Your Final Settlement Breakdown")
                         awarded = my_data.get("awarded_mw", 0)
@@ -393,9 +438,15 @@ with tab_game:
         if game["tender_capacity"] > 0:
             st.info(f"**Effective Tender Volume:** {game['tender_capacity']:.1f} MW")
         
-        if game["phase"] == "LIVE_RA" and game["last_bid_timestamp"] > 0:
-            time_left = max(0, int(60 - (time.time() - game["last_bid_timestamp"])))
-            st.metric(label="Inactivity Countdown (Ends at 0s)", value=f"{time_left}s")
+        # DUAL TIMERS DISPLAY IN LIVE_RA
+        if game["phase"] == "LIVE_RA" and game.get("ra_start_timestamp", 0) > 0:
+            now = time.time()
+            inactivity_left = max(0, int(60 - (now - game.get("last_bid_timestamp", now))))
+            auction_left = max(0, int(600 - (now - game.get("ra_start_timestamp", now))))
+            
+            c_t1, c_t2 = st.columns(2)
+            c_t1.metric("Inactivity Countdown", f"{inactivity_left}s", help="Resets to 60s on every lower bid")
+            c_t2.metric("Auction Hard Cap", f"{auction_left // 60}m {auction_left % 60}s", help="Absolute 10-minute round cap")
 
         # 1. PARTICIPANT VIEW IN PHASES 1 & 2 (Confidential)
         if not st.session_state["is_admin"] and game["phase"] in ["LOBBY", "PHASE_1", "PHASE_2"]:
@@ -414,8 +465,8 @@ with tab_game:
             st.markdown(f"### Facilitator Audit Tape ({game['phase']})")
             audit_records = []
             for t in game["teams"].values():
-                p1_status = "✅ Submitted" if t["bid_mw"] >= 50 else "⏳ Pending"
-                p2_status = "✅ Submitted" if t["ceiling_tariff"] > 0 else "⏳ Pending"
+                p1_status = "✅ Submitted" if t["bid_mw"] >= MIN_CAP else "⏳ Pending"
+                p2_status = "✅ Submitted" if t["ceiling_tariff"] >= MIN_TARIFF else "⏳ Pending"
                 
                 audit_records.append({
                     "Company": t["name"],
