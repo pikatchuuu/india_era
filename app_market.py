@@ -15,7 +15,7 @@ STATE_FILE = "market_state.json"
 ADMIN_KEY = "admin2026"
 PRICE_CAP = 300.0  # Maximum market offer ceiling ($/MWh)
 
-# Identical Fleet Specification per Team
+# Identical Fleet Specification per Team (600 MW Total)
 FLEET = {
     "Green": {"mw": 200, "mc": 0.0, "color": "#2ca02c"},
     "MidMerit": {"mw": 250, "mc": 35.0, "color": "#1f77b4"},
@@ -83,7 +83,6 @@ def clear_market(state):
     demand_remaining = state["system_demand"]
     bids = []
 
-    # Compile all unit tranches across active teams
     for t_name, t_data in state["teams"].items():
         for unit_key, spec in FLEET.items():
             bid_p = t_data["current_bids"].get(unit_key, spec["mc"])
@@ -96,14 +95,12 @@ def clear_market(state):
                 "timestamp": t_data.get("timestamp", 0)
             })
 
-    # Economic Merit Order: Lowest price first, tiebreak by submission time
     bids.sort(key=lambda x: (x["price"], x["timestamp"]))
 
     mcp = 0.0
     cleared_volume = 0.0
     marginal_label = "Unserved Demand / Deficit"
 
-    # Reset round dispatch counters
     for t in state["teams"].values():
         t["round_dispatched_mw"] = 0.0
         t["round_profit"] = 0.0
@@ -115,7 +112,7 @@ def clear_market(state):
             awarded = min(b["mw"], demand_remaining)
             demand_remaining -= awarded
             cleared_volume += awarded
-            mcp = b["price"]  # Price set by last cleared unit
+            mcp = b["price"]
             marginal_label = f"{b['team']} ({b['unit']}) @ ${mcp:.2f}"
 
             t_obj["round_dispatched_mw"] += awarded
@@ -131,7 +128,6 @@ def clear_market(state):
                 "awarded_mw": 0.0
             }
 
-    # If demand exceeds total bid generation, price spikes to cap
     if demand_remaining > 0:
         mcp = PRICE_CAP
         marginal_label = f"Deficit ({demand_remaining:.0f} MW Unserved) -> Price Cap"
@@ -140,7 +136,6 @@ def clear_market(state):
     state["cleared_mw"] = cleared_volume
     state["marginal_unit"] = marginal_label
 
-    # Calculate net operating profit: (MCP - Marginal Cost) * Dispatched MW
     for t in state["teams"].values():
         total_p = 0.0
         for unit_key, res in t.get("tranche_results", {}).items():
@@ -153,7 +148,7 @@ def clear_market(state):
     save_game(state)
 
 # ==========================================
-# 5. FACILITATOR SIDEBAR
+# 5. FACILITATOR SIDEBAR & AUTO-SIZING
 # ==========================================
 st.sidebar.title("Facilitator Panel")
 
@@ -177,20 +172,57 @@ else:
     st.sidebar.subheader("Market Controls")
     st.sidebar.write(f"**Phase:** `{game['phase']}` | **Round:** `{game['round_number']}`")
 
-    # Demand adjustment wheel
-    max_market_mw = max(600, len(game["teams"]) * 600)
+    n_teams = max(1, len(game["teams"]))
+    total_capacity = n_teams * 600
+
+    # Auto-calculated scenario presets
+    preset_oversupply = float(n_teams * 250)
+    preset_tight = float(n_teams * 500)
+    preset_scarcity = float(n_teams * 550)
+
+    st.sidebar.markdown(f"**Joined Teams:** `{n_teams}` | **Fleet Capacity:** `{total_capacity} MW`")
+
+    # Fast-set buttons based on team count
+    st.sidebar.write("**Dynamic Demand Presets:**")
+    cp1, cp2, cp3 = st.sidebar.columns(3)
+
+    if cp1.button("Oversupply", help=f"Set to {preset_oversupply:.0f} MW (~40% capacity)"):
+        s = load_game()
+        s["system_demand"] = preset_oversupply
+        save_game(s)
+        st.rerun()
+
+    if cp2.button("Tight", help=f"Set to {preset_tight:.0f} MW (~80% capacity)"):
+        s = load_game()
+        s["system_demand"] = preset_tight
+        save_game(s)
+        st.rerun()
+
+    if cp3.button("Scarcity", help=f"Set to {preset_scarcity:.0f} MW (~90% capacity)"):
+        s = load_game()
+        s["system_demand"] = preset_scarcity
+        save_game(s)
+        st.rerun()
+
+    # Manual slider adjustment
+    max_market_mw = max(600, total_capacity)
+    curr_demand_val = min(float(game["system_demand"]), float(max_market_mw))
+    
     new_demand = st.sidebar.slider(
         "System Target Demand (MW)",
-        min_value=200,
+        min_value=100,
         max_value=max_market_mw,
         step=50,
-        value=int(game["system_demand"])
+        value=int(curr_demand_val)
     )
+
     if new_demand != game["system_demand"] and game["phase"] != "SETTLEMENT":
         s = load_game()
         s["system_demand"] = float(new_demand)
         save_game(s)
         st.rerun()
+
+    st.sidebar.markdown("---")
 
     # Phase Advancement
     if game["phase"] == "LOBBY":
@@ -380,7 +412,6 @@ with col_right:
 
         st.markdown("---")
         st.markdown("### Complete Merit Order Stack")
-        # Build stacked supply curve
         all_tranches = []
         for t_name, t in game["teams"].items():
             for u_k, u_res in t.get("tranche_results", {}).items():
@@ -393,6 +424,6 @@ with col_right:
                 })
         all_tranches.sort(key=lambda x: x["Bid Price"])
         df_stack = pd.DataFrame(all_tranches)
-        df_stack["Bid Price"] = df_stack["Bid Price"].apply(lambda p: f"${p:.2f}")
-        df_stack["Cleared"] = df_stack["Cleared"].apply(lambda m: f"{m:.0f} MW")
+        df_stack["Bid Price"] = df_stack["Bid Price"].apply(p: f"${p:.2f}")
+        df_stack["Cleared"] = df_stack["Cleared"].apply(m: f"{m:.0f} MW")
         st.dataframe(df_stack, use_container_width=True, hide_index=True)
