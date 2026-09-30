@@ -97,9 +97,11 @@ def advance_game_phase():
         state["phase"] = "PHASE_1"
     elif phase == "PHASE_1":
         total_mw = sum(t["bid_mw"] for t in state["teams"].values())
+        # Tender capacity: min(1500 MW, 80% total submitted)
         state["tender_capacity"] = min(1500.0, 0.80 * total_mw)
         state["phase"] = "PHASE_2"
     elif phase == "PHASE_2":
+        # H1 Elimination: highest ceiling tariff eliminated; ties to later timestamp
         sorted_teams = sorted(
             state["teams"].values(),
             key=lambda t: (-t["ceiling_tariff"], t["timestamp"])
@@ -126,24 +128,31 @@ def finalize_settlement(state):
         remaining_cap -= awarded
         team["awarded_mw"] = awarded
         
+        # Land assignment (100 MW initial + random bonus)
         bonus_land = int(np.random.randint(10, 101))
         team["bonus_land"] = bonus_land
         total_land = 100.0 + bonus_land
+        team["total_land"] = total_land
         
         if awarded > 0:
             base = lookup_base_irr(team["current_tariff"], awarded)
             land_deficit = max(0.0, awarded - total_land)
             unawarded = team["bid_mw"] - awarded
             
+            # Penalties: 1 bp = 0.0001 per MW
             land_pen = land_deficit * 0.0001
             unawarded_pen = unawarded * 0.0001
             
             final_irr = base - land_pen - unawarded_pen
             team["base_irr"] = base
+            team["land_pen_bps"] = int(round(land_pen * 10000))
+            team["unawarded_pen_bps"] = int(round(unawarded_pen * 10000))
             team["final_irr"] = final_irr
             team["meets_hurdle"] = bool(final_irr >= 0.14)
         else:
             team["base_irr"] = 0.0
+            team["land_pen_bps"] = 0
+            team["unawarded_pen_bps"] = int(round(team["bid_mw"] * 1.0))
             team["final_irr"] = 0.0
             team["meets_hurdle"] = False
 
@@ -227,7 +236,10 @@ with col_left:
                                 "qualified": True,
                                 "awarded_mw": 0,
                                 "bonus_land": 0,
+                                "total_land": 100,
                                 "base_irr": 0.0,
+                                "land_pen_bps": 0,
+                                "unawarded_pen_bps": 0,
                                 "final_irr": 0.0,
                                 "meets_hurdle": False
                             }
@@ -247,7 +259,10 @@ with col_left:
                     "qualified": True,
                     "awarded_mw": 0,
                     "bonus_land": 0,
+                    "total_land": 100,
                     "base_irr": 0.0,
+                    "land_pen_bps": 0,
+                    "unawarded_pen_bps": 0,
                     "final_irr": 0.0,
                     "meets_hurdle": False
                 }
@@ -259,9 +274,10 @@ with col_left:
             if not my_data.get("qualified", True):
                 st.error("Your company was eliminated under the H1 Ceiling Rule.")
             else:
+                # Envelope I Submission
                 if game["phase"] == "PHASE_1":
                     with st.form("env1_form"):
-                        st.write("**Envelope I: Technical Bid**")
+                        st.write("**Envelope I: Technical Bid (Confidential)**")
                         default_mw = my_data.get("bid_mw") if my_data.get("bid_mw", 0) >= 50 else 100
                         mw = st.number_input("Bidding Capacity (MW) [50-750 MW in increments of 10]", min_value=50, max_value=750, step=10, value=default_mw)
                         if st.form_submit_button("Submit Capacity"):
@@ -271,9 +287,10 @@ with col_left:
                             st.success(f"Submitted: {mw} MW")
                             st.rerun()
 
+                # Envelope II Submission
                 elif game["phase"] == "PHASE_2":
                     with st.form("env2_form"):
-                        st.write("**Envelope II: Financial Bid**")
+                        st.write("**Envelope II: Financial Bid (Confidential)**")
                         default_t = my_data.get("ceiling_tariff") if my_data.get("ceiling_tariff", 0.0) > 0 else 2.70
                         t_val = st.number_input("Ceiling Tariff (INR/kWh)", min_value=1.00, max_value=5.00, step=0.01, value=default_t, format="%.2f")
                         if st.form_submit_button("Submit Ceiling Tariff"):
@@ -285,6 +302,7 @@ with col_left:
                             st.success(f"Submitted Ceiling Tariff: {t_val:.2f}")
                             st.rerun()
 
+                # Phase 3: Live Reverse Auction
                 elif game["phase"] == "LIVE_RA":
                     st.write(f"Your Active Tariff: **{my_data.get('current_tariff', 0.0):.2f} INR/kWh**")
                     with st.form("bid_form"):
@@ -304,12 +322,45 @@ with col_left:
 
                 elif game["phase"] == "LOBBY":
                     st.info("Waiting for the Facilitator to start Envelope I...")
+
+                # Phase 4: Final Settlement Breakdown Card
                 elif game["phase"] == "SETTLEMENT":
-                    st.info("The auction has concluded. See the results board on the right.")
+                    st.markdown("### 📊 Your Final Settlement Breakdown")
+                    awarded = my_data.get("awarded_mw", 0)
+                    bonus = my_data.get("bonus_land", 0)
+                    total_land = my_data.get("total_land", 100 + bonus)
+                    land_pen = my_data.get("land_pen_bps", 0)
+                    unawarded_pen = my_data.get("unawarded_pen_bps", 0)
+                    base_irr = my_data.get("base_irr", 0.0)
+                    final_irr = my_data.get("final_irr", 0.0)
+                    hurdle = my_data.get("meets_hurdle", False)
+
+                    c1, c2 = st.columns(2)
+                    c1.metric("Bid Capacity", f"{my_data.get('bid_mw', 0)} MW")
+                    c2.metric("Awarded Capacity", f"{awarded} MW")
+
+                    st.markdown("---")
+                    st.markdown(f"**Land Allocation:**")
+                    st.write(f"• Base Starting Land: `100 MW`")
+                    st.write(f"• 🎲 Random Bonus Land Awarded: `+{bonus} MW`")
+                    st.write(f"• **Total Land Available:** `{total_land} MW`")
+
+                    st.markdown("---")
+                    st.markdown(f"**IRR & Basis Point Adjustments:**")
+                    st.write(f"• Base Model IRR: `{base_irr * 100:.2f}%`")
+                    st.write(f"• Land Shortage Penalty: `-{land_pen} bps` (-{land_pen/100:.2f}%)")
+                    st.write(f"• Unawarded MW Penalty: `-{unawarded_pen} bps` (-{unawarded_pen/100:.2f}%)")
+                    
+                    st.markdown(f"### Net Final IRR: `{final_irr * 100:.2f}%`")
+                    if hurdle:
+                        st.success("🏆 Hurdle Achieved: Qualified with >= 14.00% IRR!")
+                    else:
+                        st.error("❌ Hurdle Missed: Net IRR is below 14.00%.")
 
 # --- RIGHT COLUMN: LEADERBOARD & STATUS ---
 with col_right:
     st.subheader("Tender Status & Standings")
+    
     if game["tender_capacity"] > 0:
         st.info(f"**Effective Tender Volume:** {game['tender_capacity']:.1f} MW")
     
@@ -317,25 +368,52 @@ with col_right:
         time_left = max(0, int(60 - (time.time() - game["last_bid_timestamp"])))
         st.metric(label="Inactivity Countdown (Ends at 0s)", value=f"{time_left}s")
 
-    records = []
-    teams_list = list(game["teams"].values())
-    if game["phase"] == "LIVE_RA":
-        teams_list.sort(key=lambda x: (x["current_tariff"], x["timestamp"]))
-    elif game["phase"] == "SETTLEMENT":
-        teams_list.sort(key=lambda x: -x["final_irr"])
-
-    for idx, t in enumerate(teams_list):
-        status = "Active" if t["qualified"] else "Eliminated (H1)"
-        if game["phase"] == "SETTLEMENT":
-            status = f"Awarded {t['awarded_mw']} MW | Net IRR: {t['final_irr']*100:.2f}% {'🏆 Pass' if t['meets_hurdle'] else '❌ Fail (<14%)'}"
+    # Information Isolation: Hide early competitor bids from teams
+    if not st.session_state["is_admin"] and game["phase"] in ["LOBBY", "PHASE_1", "PHASE_2"]:
+        st.markdown("### Submission Status")
+        if current_team_name:
+            my_team = game["teams"].get(current_team_name, {})
+            c1, c2 = st.columns(2)
+            c1.metric("Envelope I (MW)", f"{my_team.get('bid_mw', 0)} MW" if my_team.get('bid_mw', 0) > 0 else "Pending")
+            c2.metric("Envelope II (Ceiling)", f"{my_team.get('ceiling_tariff', 0.0):.2f}" if my_team.get('ceiling_tariff', 0.0) > 0 else "Pending")
+            st.info("🔒 Confidential Bidding: Competitor bids and merit rankings remain hidden until Phase 3 (Live Reverse Auction).")
+        else:
+            st.info("🔒 Log in to view your company's submission status.")
+            
+    else:
+        # Full public view in LIVE_RA and SETTLEMENT (and always for Facilitator)
+        teams_list = list(game["teams"].values())
         
-        prefix = f"L{idx+1} - " if game["phase"] == "LIVE_RA" and t["qualified"] else ""
-        records.append({
-            "Company": f"{prefix}{t['name']}",
-            "Bid (MW)": t["bid_mw"],
-            "Current Tariff": f"{t['current_tariff']:.2f}" if t["current_tariff"] > 0 else "--",
-            "Status": status
-        })
+        if game["phase"] == "LIVE_RA":
+            teams_list.sort(key=lambda x: (x["current_tariff"], x["timestamp"]))
+            records = []
+            for idx, t in enumerate(teams_list):
+                status = "Active" if t["qualified"] else "Eliminated (H1)"
+                prefix = f"L{idx+1} - " if t["qualified"] else ""
+                records.append({
+                    "Rank / Company": f"{prefix}{t['name']}",
+                    "Bid (MW)": t["bid_mw"],
+                    "Current Tariff": f"{t['current_tariff']:.2f}" if t["current_tariff"] > 0 else "--",
+                    "Status": status
+                })
+            st.dataframe(pd.DataFrame(records), use_container_width=True, hide_index=True)
 
-    if records:
-        st.dataframe(pd.DataFrame(records), use_container_width=True, hide_index=True)
+        elif game["phase"] == "SETTLEMENT":
+            teams_list.sort(key=lambda x: -x["final_irr"])
+            records = []
+            for t in teams_list:
+                status = "🏆 Pass (>=14%)" if t["meets_hurdle"] else "❌ Fail (<14%)"
+                if not t["qualified"]:
+                    status = "Eliminated (H1)"
+                records.append({
+                    "Company": t["name"],
+                    "Awarded (MW)": t.get("awarded_mw", 0),
+                    "Total Land (MW)": t.get("total_land", 100),
+                    "Final Tariff": f"{t['current_tariff']:.2f}",
+                    "Base IRR": f"{t.get('base_irr', 0.0)*100:.2f}%",
+                    "Land Pen": f"-{t.get('land_pen_bps', 0)} bps",
+                    "Unawarded Pen": f"-{t.get('unawarded_pen_bps', 0)} bps",
+                    "Net Final IRR": f"{t.get('final_irr', 0.0)*100:.2f}%",
+                    "Verdict": status
+                })
+            st.dataframe(pd.DataFrame(records), use_container_width=True, hide_index=True)
