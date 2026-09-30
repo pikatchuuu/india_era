@@ -1,35 +1,73 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
 import json
 import time
+import os
 
 st.set_page_config(page_title="India RE Reverse Auction", layout="wide")
 
+# Poll every 2 seconds to synchronize with the server file
+st_autorefresh(interval=2000, key="global_sync")
+
+STATE_FILE = "game_state.json"
 ADMIN_KEY = "admin2026"
 
+# ==========================================
+# 1. CENTRAL DISK-BASED STATE ENGINE
+# ==========================================
+def init_default_state():
+    return {
+        "game_id": 1,
+        "phase": "LOBBY",  # LOBBY, PHASE_1, PHASE_2, LIVE_RA, SETTLEMENT
+        "tender_capacity": 0.0,
+        "last_bid_timestamp": 0.0,
+        "teams": {}
+    }
+
+def load_game():
+    if not os.path.exists(STATE_FILE):
+        state = init_default_state()
+        save_game(state)
+        return state
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        time.sleep(0.05)
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+
+def save_game(state):
+    temp_file = STATE_FILE + ".tmp"
+    with open(temp_file, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(temp_file, STATE_FILE)
+
+game = load_game()
+
+# ==========================================
+# 2. PERSISTENT LOGIN RECOVERY
+# ==========================================
+url_team = st.query_params.get("team")
+if url_team:
+    st.session_state["team_name"] = url_team
+elif "team_name" in st.session_state and st.session_state["team_name"]:
+    st.query_params["team"] = st.session_state["team_name"]
+
+# ==========================================
+# 3. FACILITATOR AUTHENTICATION
+# ==========================================
 if "is_admin" not in st.session_state:
     st.session_state["is_admin"] = False
 
 if st.query_params.get("role") == "admin":
     st.session_state["is_admin"] = True
 
-@st.cache_resource
-def get_global_game_state():
-    return {
-        "game_id": 1,
-        "phase": "LOBBY",
-        "tender_capacity": 0.0,
-        "last_bid_timestamp": 0.0,
-        "teams": {}
-    }
-
-game = get_global_game_state()
-
-if st.session_state.get("active_game_id") != game["game_id"]:
-    st.session_state["team_name"] = None
-    st.session_state["active_game_id"] = game["game_id"]
-
+# ==========================================
+# 4. IRR MATRIX ENGINE
+# ==========================================
 @st.cache_data
 def load_irr_engine():
     with open('irr_matrix.json', 'r') as f:
@@ -43,35 +81,44 @@ def lookup_base_irr(tariff: float, capacity: float) -> float:
         return 0.0
     caps = irr_data['capacities']
     tariffs = irr_data['tariffs']
+    
     cap_idx = min(range(len(caps)), key=lambda i: abs(caps[i] - capacity))
     tariff_idx = min(range(len(tariffs)), key=lambda i: abs(tariffs[i] - tariff))
     return float(irr_data['grid'][tariff_idx][cap_idx])
 
+# ==========================================
+# 5. GAME TRANSITIONS & SETTLEMENT
+# ==========================================
 def advance_game_phase():
-    phase = game["phase"]
+    state = load_game()
+    phase = state["phase"]
+    
     if phase == "LOBBY":
-        game["phase"] = "PHASE_1"
+        state["phase"] = "PHASE_1"
     elif phase == "PHASE_1":
-        total_mw = sum(t["bid_mw"] for t in game["teams"].values())
-        game["tender_capacity"] = min(1500.0, 0.80 * total_mw)
-        game["phase"] = "PHASE_2"
+        total_mw = sum(t["bid_mw"] for t in state["teams"].values())
+        state["tender_capacity"] = min(1500.0, 0.80 * total_mw)
+        state["phase"] = "PHASE_2"
     elif phase == "PHASE_2":
         sorted_teams = sorted(
-            game["teams"].values(),
+            state["teams"].values(),
             key=lambda t: (-t["ceiling_tariff"], t["timestamp"])
         )
         if sorted_teams:
             eliminated = sorted_teams[0]["name"]
-            game["teams"][eliminated]["qualified"] = False
-        game["phase"] = "LIVE_RA"
-        game["last_bid_timestamp"] = time.time()
+            state["teams"][eliminated]["qualified"] = False
+        state["phase"] = "LIVE_RA"
+        state["last_bid_timestamp"] = time.time()
     elif phase == "LIVE_RA":
-        finalize_settlement()
+        finalize_settlement(state)
+        
+    save_game(state)
 
-def finalize_settlement():
-    game["phase"] = "SETTLEMENT"
-    remaining_cap = game["tender_capacity"]
-    active = [t for t in game["teams"].values() if t["qualified"]]
+def finalize_settlement(state):
+    state["phase"] = "SETTLEMENT"
+    remaining_cap = state["tender_capacity"]
+    
+    active = [t for t in state["teams"].values() if t["qualified"]]
     active.sort(key=lambda t: (t["current_tariff"], t["timestamp"]))
     
     for team in active:
@@ -79,7 +126,7 @@ def finalize_settlement():
         remaining_cap -= awarded
         team["awarded_mw"] = awarded
         
-        bonus_land = np.random.randint(10, 101)
+        bonus_land = int(np.random.randint(10, 101))
         team["bonus_land"] = bonus_land
         total_land = 100.0 + bonus_land
         
@@ -87,12 +134,14 @@ def finalize_settlement():
             base = lookup_base_irr(team["current_tariff"], awarded)
             land_deficit = max(0.0, awarded - total_land)
             unawarded = team["bid_mw"] - awarded
+            
             land_pen = land_deficit * 0.0001
             unawarded_pen = unawarded * 0.0001
+            
             final_irr = base - land_pen - unawarded_pen
             team["base_irr"] = base
             team["final_irr"] = final_irr
-            team["meets_hurdle"] = (final_irr >= 0.14)
+            team["meets_hurdle"] = bool(final_irr >= 0.14)
         else:
             team["base_irr"] = 0.0
             team["final_irr"] = 0.0
@@ -101,9 +150,17 @@ def finalize_settlement():
 if game["phase"] == "LIVE_RA" and game["last_bid_timestamp"] > 0:
     elapsed = time.time() - game["last_bid_timestamp"]
     if elapsed >= 60.0:
-        finalize_settlement()
+        state = load_game()
+        if state["phase"] == "LIVE_RA":
+            finalize_settlement(state)
+            save_game(state)
+            game = state
 
+# ==========================================
+# 6. FACILITATOR SIDEBAR
+# ==========================================
 st.sidebar.title("Access Control")
+
 if not st.session_state["is_admin"]:
     with st.sidebar.expander("Facilitator Login"):
         entered_key = st.text_input("Enter Admin Key", type="password")
@@ -129,31 +186,39 @@ else:
         st.rerun()
 
     if st.sidebar.button("Start New Game / Reset All"):
-        game["game_id"] += 1
-        game["phase"] = "LOBBY"
-        game["tender_capacity"] = 0.0
-        game["last_bid_timestamp"] = 0.0
-        game["teams"].clear()
-        st.sidebar.success("New game initialized. All sessions cleared.")
+        fresh = init_default_state()
+        fresh["game_id"] = game["game_id"] + 1
+        save_game(fresh)
+        st.sidebar.success("Game reset. All data cleared.")
         st.rerun()
 
+# ==========================================
+# 7. MAIN INTERFACE
+# ==========================================
 st.title("India RE Reverse Auction Simulator")
+
 col_left, col_right = st.columns([1, 1])
 
+# --- LEFT COLUMN: TEAM PORTAL ---
 with col_left:
     st.subheader("Your Team Portal")
+
     if st.session_state["is_admin"]:
-        st.info("You are logged in as the Facilitator. Use the sidebar controls to advance rounds or reset.")
+        st.info("You are the Facilitator. Use the sidebar controls to advance rounds or reset.")
     else:
-        team_name = st.session_state.get("team_name")
-        if not team_name:
+        current_team_name = st.session_state.get("team_name")
+
+        if not current_team_name:
             with st.form("login_form"):
                 name_input = st.text_input("Company Name:").strip()
                 if st.form_submit_button("Join Game"):
                     if name_input:
                         st.session_state["team_name"] = name_input
-                        if name_input not in game["teams"]:
-                            game["teams"][name_input] = {
+                        st.query_params["team"] = name_input
+                        
+                        state = load_game()
+                        if name_input not in state["teams"]:
+                            state["teams"][name_input] = {
                                 "name": name_input,
                                 "bid_mw": 0,
                                 "ceiling_tariff": 0.0,
@@ -166,31 +231,60 @@ with col_left:
                                 "final_irr": 0.0,
                                 "meets_hurdle": False
                             }
+                            save_game(state)
                         st.rerun()
         else:
-            st.success(f"Logged in as: **{team_name}**")
-            my_data = game["teams"].get(team_name, {})
+            st.success(f"Logged in as: **{current_team_name}**")
+            
+            if current_team_name not in game["teams"]:
+                state = load_game()
+                state["teams"][current_team_name] = {
+                    "name": current_team_name,
+                    "bid_mw": 0,
+                    "ceiling_tariff": 0.0,
+                    "current_tariff": 0.0,
+                    "timestamp": time.time(),
+                    "qualified": True,
+                    "awarded_mw": 0,
+                    "bonus_land": 0,
+                    "base_irr": 0.0,
+                    "final_irr": 0.0,
+                    "meets_hurdle": False
+                }
+                save_game(state)
+                game = state
+
+            my_data = game["teams"][current_team_name]
+
             if not my_data.get("qualified", True):
                 st.error("Your company was eliminated under the H1 Ceiling Rule.")
             else:
                 if game["phase"] == "PHASE_1":
                     with st.form("env1_form"):
                         st.write("**Envelope I: Technical Bid**")
-                        mw = st.number_input("Bidding Capacity (MW) [50-750 MW in increments of 10]", min_value=50, max_value=750, step=10, value=100)
+                        default_mw = my_data.get("bid_mw") if my_data.get("bid_mw", 0) >= 50 else 100
+                        mw = st.number_input("Bidding Capacity (MW) [50-750 MW in increments of 10]", min_value=50, max_value=750, step=10, value=default_mw)
                         if st.form_submit_button("Submit Capacity"):
-                            my_data["bid_mw"] = int(mw)
+                            state = load_game()
+                            state["teams"][current_team_name]["bid_mw"] = int(mw)
+                            save_game(state)
                             st.success(f"Submitted: {mw} MW")
                             st.rerun()
+
                 elif game["phase"] == "PHASE_2":
                     with st.form("env2_form"):
                         st.write("**Envelope II: Financial Bid**")
-                        t_val = st.number_input("Ceiling Tariff (INR/kWh)", min_value=1.00, max_value=5.00, step=0.01, value=2.70, format="%.2f")
+                        default_t = my_data.get("ceiling_tariff") if my_data.get("ceiling_tariff", 0.0) > 0 else 2.70
+                        t_val = st.number_input("Ceiling Tariff (INR/kWh)", min_value=1.00, max_value=5.00, step=0.01, value=default_t, format="%.2f")
                         if st.form_submit_button("Submit Ceiling Tariff"):
-                            my_data["ceiling_tariff"] = float(t_val)
-                            my_data["current_tariff"] = float(t_val)
-                            my_data["timestamp"] = time.time()
+                            state = load_game()
+                            state["teams"][current_team_name]["ceiling_tariff"] = float(t_val)
+                            state["teams"][current_team_name]["current_tariff"] = float(t_val)
+                            state["teams"][current_team_name]["timestamp"] = time.time()
+                            save_game(state)
                             st.success(f"Submitted Ceiling Tariff: {t_val:.2f}")
                             st.rerun()
+
                 elif game["phase"] == "LIVE_RA":
                     st.write(f"Your Active Tariff: **{my_data.get('current_tariff', 0.0):.2f} INR/kWh**")
                     with st.form("bid_form"):
@@ -198,18 +292,22 @@ with col_left:
                         new_bid = st.number_input("Submit Undercut Tariff (INR/kWh)", min_value=1.00, max_value=5.00, step=0.01, value=default_undercut, format="%.2f")
                         if st.form_submit_button("Submit Bid"):
                             if new_bid < my_data["current_tariff"]:
-                                my_data["current_tariff"] = float(new_bid)
-                                my_data["timestamp"] = time.time()
-                                game["last_bid_timestamp"] = time.time()
+                                state = load_game()
+                                state["teams"][current_team_name]["current_tariff"] = float(new_bid)
+                                state["teams"][current_team_name]["timestamp"] = time.time()
+                                state["last_bid_timestamp"] = time.time()
+                                save_game(state)
                                 st.success(f"Undercut bid of {new_bid:.2f} accepted.")
                                 st.rerun()
                             else:
                                 st.error("Bid must be strictly lower than your active tariff.")
+
                 elif game["phase"] == "LOBBY":
                     st.info("Waiting for the Facilitator to start Envelope I...")
                 elif game["phase"] == "SETTLEMENT":
                     st.info("The auction has concluded. See the results board on the right.")
 
+# --- RIGHT COLUMN: LEADERBOARD & STATUS ---
 with col_right:
     st.subheader("Tender Status & Standings")
     if game["tender_capacity"] > 0:
@@ -241,7 +339,3 @@ with col_right:
 
     if records:
         st.dataframe(pd.DataFrame(records), use_container_width=True, hide_index=True)
-
-if game["phase"] == "LIVE_RA":
-    time.sleep(2)
-    st.rerun()
