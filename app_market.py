@@ -414,7 +414,7 @@ with col_right:
         st.success(f"Market Cleared @ **${game['clearing_price']:.2f} / MWh**")
         st.caption(f"Realized Demand: **{act_d:.1f} MW** (Expected: {exp_d:.0f} MW) | Marginal State: **{game['marginal_unit']}**")
 
-        # Supply Curve Chart
+        # Supply Curve Chart (Fixed Staircase Logic)
         st.markdown("### 📊 Merit Order Supply Curve")
         all_tranches = []
         for t_name, t in game["teams"].items():
@@ -426,27 +426,34 @@ with col_right:
                     "Capacity": FLEET[u_k]["mw"]
                 })
 
+        # Sort tranches strictly by bid price
         all_tranches.sort(key=lambda x: x["Bid Price"])
 
-        x_coords = [0.0]
+        x_coords = []
         y_coords = []
         hover_text = []
 
         cum_mw = 0.0
+
         for item in all_tranches:
             p = item["Bid Price"]
             cap = item["Capacity"]
             label = f"Team: {item['Team']}<br>Unit: {item['Unit']}<br>Offer: ${p:.2f}/MWh<br>Capacity: {cap} MW"
 
+            # Start of block at current cumulative MW
+            x_coords.append(cum_mw)
             y_coords.append(p)
             hover_text.append(label)
 
+            # End of block at updated cumulative MW
             cum_mw += cap
             x_coords.append(cum_mw)
             y_coords.append(p)
             hover_text.append(label)
 
         fig = go.Figure()
+
+        # Plot supply curve with 'hv' step shape
         fig.add_trace(go.Scatter(
             x=x_coords,
             y=y_coords,
