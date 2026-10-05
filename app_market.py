@@ -1,3 +1,16 @@
+import os
+import json
+
+# Force-reset state if it's corrupted or causing a startup hang
+STATE_FILE = "game_state.json"
+if os.path.exists(STATE_FILE):
+    try:
+        with open(STATE_FILE, "r") as f:
+            json.load(f)
+    except Exception:
+        # If it's corrupted, delete it so it recreates cleanly
+        os.remove(STATE_FILE)
+
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import pandas as pd
