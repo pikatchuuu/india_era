@@ -2,36 +2,32 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
 import json
 import time
 import os
 
 st.set_page_config(page_title="Wholesale Power Market Sim", layout="wide")
 
-# Sync state across browsers every 2 seconds
 st_autorefresh(interval=2000, key="market_sync")
 
 STATE_FILE = "market_state.json"
 ADMIN_KEY = "admin2026"
-PRICE_CAP = 300.0  # Maximum market offer ceiling ($/MWh)
+PRICE_CAP = 300.0
 
-# Identical Fleet Specification per Team (600 MW Total)
 FLEET = {
     "Green": {"mw": 200, "mc": 0.0, "color": "#2ca02c"},
     "MidMerit": {"mw": 250, "mc": 35.0, "color": "#1f77b4"},
     "Peaker": {"mw": 150, "mc": 75.0, "color": "#d62728"}
 }
 
-# ==========================================
-# 1. CENTRAL DISK-BASED STATE ENGINE
-# ==========================================
 def init_default_state():
     return {
         "game_id": 1,
         "round_number": 1,
-        "phase": "LOBBY",  # LOBBY, BIDDING, SETTLEMENT
+        "phase": "LOBBY",
         "expected_demand": 1200.0,
-        "demand_std_pct": 0.03,  # 3% standard deviation default
+        "demand_std_pct": 0.05,
         "actual_demand": 1200.0,
         "clearing_price": 0.0,
         "cleared_mw": 0.0,
@@ -60,40 +56,28 @@ def save_game(state):
 
 game = load_game()
 
-# ==========================================
-# 2. PERSISTENT LOGIN RECOVERY (URL-BACKED)
-# ==========================================
 url_team = st.query_params.get("team")
 if url_team:
     st.session_state["team_name"] = url_team
 elif "team_name" in st.session_state and st.session_state["team_name"]:
     st.query_params["team"] = st.session_state["team_name"]
 
-# ==========================================
-# 3. FACILITATOR AUTHENTICATION
-# ==========================================
 if "is_admin" not in st.session_state:
     st.session_state["is_admin"] = False
 
 if st.query_params.get("role") == "admin":
     st.session_state["is_admin"] = True
 
-# ==========================================
-# 4. MARKET CLEARING ENGINE (PROPORTIONAL TIE-BREAKING)
-# ==========================================
 def clear_market(state):
-    # Sample actual demand using Normal Distribution centered at Expected Demand
     mean_d = state.get("expected_demand", 1200.0)
     std_pct = state.get("demand_std_pct", 0.05)
     std_dev = mean_d * std_pct
     
-    # Draw realized demand (bounded to non-negative)
     realized_demand = max(0.0, round(float(np.random.normal(mean_d, std_dev)), 1))
     state["actual_demand"] = realized_demand
     
     demand_remaining = realized_demand
 
-    # Collect all bids
     bids = []
     for t_name, t_data in state["teams"].items():
         for unit_key, spec in FLEET.items():
@@ -106,7 +90,6 @@ def clear_market(state):
                 "price": bid_p
             })
 
-    # Reset results for all teams
     for t in state["teams"].values():
         t["round_dispatched_mw"] = 0.0
         t["round_profit"] = 0.0
@@ -119,7 +102,6 @@ def clear_market(state):
             for unit_key in FLEET
         }
 
-    # Group bids by offer price for proportional tie clearing
     bids_by_price = {}
     for b in bids:
         bids_by_price.setdefault(b["price"], []).append(b)
@@ -128,7 +110,6 @@ def clear_market(state):
     cleared_volume = 0.0
     marginal_label = "Unserved Demand / Deficit"
 
-    # Process price steps from lowest to highest
     for price in sorted(bids_by_price.keys()):
         tier_bids = bids_by_price[price]
         tier_total_mw = sum(b["mw"] for b in tier_bids)
@@ -139,7 +120,6 @@ def clear_market(state):
         mcp = price
 
         if tier_total_mw <= demand_remaining:
-            # Entire price tier cleared 100%
             for b in tier_bids:
                 awarded = float(b["mw"])
                 state["teams"][b["team"]]["tranche_results"][b["unit"]]["awarded_mw"] = awarded
@@ -149,7 +129,6 @@ def clear_market(state):
             cleared_volume += tier_total_mw
             marginal_label = f"Fully Cleared @ ${mcp:.2f}"
         else:
-            # Marginal Tier: Allocate remaining demand proportionally among tied offers
             allocation_ratio = demand_remaining / tier_total_mw
 
             for b in tier_bids:
@@ -161,7 +140,6 @@ def clear_market(state):
             marginal_label = f"Marginal Tie ({len(tier_bids)} units split) @ ${mcp:.2f}"
             demand_remaining = 0.0
 
-    # Scarcity Pricing Trigger
     if demand_remaining > 0:
         mcp = PRICE_CAP
         marginal_label = f"Deficit ({demand_remaining:.0f} MW Unserved) -> Price Cap"
@@ -170,7 +148,6 @@ def clear_market(state):
     state["cleared_mw"] = cleared_volume
     state["marginal_unit"] = marginal_label
 
-    # Calculate Profits
     for t in state["teams"].values():
         total_p = 0.0
         for unit_key, res in t.get("tranche_results", {}).items():
@@ -182,9 +159,7 @@ def clear_market(state):
     state["phase"] = "SETTLEMENT"
     save_game(state)
 
-# ==========================================
-# 5. FACILITATOR SIDEBAR & AUTO-SIZING
-# ==========================================
+# Facilitator Panel
 st.sidebar.title("Facilitator Panel")
 
 if not st.session_state["is_admin"]:
@@ -237,7 +212,6 @@ else:
         save_game(s)
         st.rerun()
 
-    # Manual expected demand slider
     max_market_mw = max(600, total_capacity)
     curr_exp_val = min(float(game.get("expected_demand", 1200.0)), float(max_market_mw))
 
@@ -249,7 +223,6 @@ else:
         value=int(curr_exp_val)
     )
 
-    # Standard Deviation / Demand Uncertainty setting
     demand_std_pct = st.sidebar.slider(
         "Demand Uncertainty (Std Dev %)",
         min_value=0.0,
@@ -268,7 +241,6 @@ else:
 
     st.sidebar.markdown("---")
 
-    # Phase Advancement
     if game["phase"] == "LOBBY":
         if st.sidebar.button("Open Bidding Round", type="primary"):
             s = load_game()
@@ -305,15 +277,12 @@ else:
         save_game(fresh)
         st.rerun()
 
-# ==========================================
-# 6. MAIN USER INTERFACE
-# ==========================================
+# Main Interface
 st.title("⚡ Wholesale Power Market Simulator")
 st.caption("Uniform Clearing Price • Proportional Marginal Tie-Breaking • Stochastic Demand")
 
 col_left, col_right = st.columns([1, 1])
 
-# --- LEFT COLUMN: TEAM PORTAL ---
 with col_left:
     st.subheader("Generation Portfolio")
 
@@ -422,7 +391,6 @@ with col_left:
                 st.dataframe(pd.DataFrame(records), use_container_width=True, hide_index=True)
                 st.metric("Total Cumulative Bank Balance", f"${tot_profit:,.2f}")
 
-# --- RIGHT COLUMN: MARKET STACK & LEADERBOARD ---
 with col_right:
     st.subheader("Market Clearing Board")
 
@@ -446,6 +414,76 @@ with col_right:
         st.success(f"Market Cleared @ **${game['clearing_price']:.2f} / MWh**")
         st.caption(f"Realized Demand: **{act_d:.1f} MW** (Expected: {exp_d:.0f} MW) | Marginal State: **{game['marginal_unit']}**")
 
+        # Supply Curve Chart
+        st.markdown("### 📊 Merit Order Supply Curve")
+        all_tranches = []
+        for t_name, t in game["teams"].items():
+            for u_k, u_res in t.get("tranche_results", {}).items():
+                all_tranches.append({
+                    "Team": t_name,
+                    "Unit": u_k,
+                    "Bid Price": u_res["bid"],
+                    "Capacity": FLEET[u_k]["mw"]
+                })
+
+        all_tranches.sort(key=lambda x: x["Bid Price"])
+
+        x_coords = [0.0]
+        y_coords = []
+        hover_text = []
+
+        cum_mw = 0.0
+        for item in all_tranches:
+            p = item["Bid Price"]
+            cap = item["Capacity"]
+            label = f"Team: {item['Team']}<br>Unit: {item['Unit']}<br>Offer: ${p:.2f}/MWh<br>Capacity: {cap} MW"
+
+            y_coords.append(p)
+            hover_text.append(label)
+
+            cum_mw += cap
+            x_coords.append(cum_mw)
+            y_coords.append(p)
+            hover_text.append(label)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=x_coords,
+            y=y_coords,
+            mode='lines',
+            name='Supply Curve',
+            line=dict(color='#1f77b4', width=3, shape='hv'),
+            text=hover_text,
+            hoverinfo='text+x+y'
+        ))
+
+        fig.add_vline(
+            x=act_d,
+            line_dash="dash",
+            line_color="red",
+            annotation_text=f"Cleared Demand: {act_d:.1f} MW",
+            annotation_position="top left"
+        )
+
+        fig.add_hline(
+            y=game["clearing_price"],
+            line_dash="dot",
+            line_color="green",
+            annotation_text=f"MCP: ${game['clearing_price']:.2f}",
+            annotation_position="bottom right"
+        )
+
+        fig.update_layout(
+            xaxis_title="Cumulative Capacity (MW)",
+            yaxis_title="Offer Price ($/MWh)",
+            margin=dict(l=20, r=20, t=30, b=20),
+            height=380,
+            hovermode="x unified"
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("---")
         st.markdown("### 🏆 Profit Leaderboard")
         leaderboard = []
         for t in game["teams"].values():
@@ -463,19 +501,8 @@ with col_right:
 
         st.markdown("---")
         st.markdown("### Complete Merit Order Stack")
-        all_tranches = []
-        for t_name, t in game["teams"].items():
-            for u_k, u_res in t.get("tranche_results", {}).items():
-                all_tranches.append({
-                    "Team": t_name,
-                    "Unit": u_k,
-                    "Bid Price": u_res["bid"],
-                    "Capacity": FLEET[u_k]["mw"],
-                    "Cleared": u_res["awarded_mw"]
-                })
-        all_tranches.sort(key=lambda x: x["Bid Price"])
         df_stack = pd.DataFrame(all_tranches)
+        df_stack["Cleared"] = [game["teams"][x["Team"]]["tranche_results"][x["Unit"]]["awarded_mw"] for x in all_tranches]
         df_stack["Bid Price"] = df_stack["Bid Price"].apply(lambda p: f"${p:.2f}")
         df_stack["Cleared"] = df_stack["Cleared"].apply(lambda m: f"{m:.1f} MW")
         st.dataframe(df_stack, use_container_width=True, hide_index=True)
-
